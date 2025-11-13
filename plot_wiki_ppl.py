@@ -107,10 +107,10 @@ def aggregate_over_articles(
     max_context_sentences: int = 10
 ) -> Tuple[List[int], List[float], List[float], List[float], List[float]]:
     """
-    記事ごとに、コンテキスト文数を1..kと増やしながら
+    記事ごとに、開始位置をずらしつつ（スライディング）、コンテキスト文数を1..kと増やしながら
     - 平均PPL（mean）と標準偏差（std）
     - 正規化エントロピー（loss / ln(vocab)）のmean,std
-    を集計する。
+    を集計する（デフォルトで全スタート位置を網羅）。
     返り値: xs, ppl_mean, ppl_std, nent_mean, nent_std
     """
     vocab_size = len(tokenizer)
@@ -121,16 +121,22 @@ def aggregate_over_articles(
     nent_buckets: Dict[int, List[float]] = {i: [] for i in range(1, max_context_sentences + 1)}
 
     for sents in articles:
+        n = len(sents)
         # その記事で扱う最大コンテキスト長
-        k = min(max_context_sentences, max(1, len(sents) - 1))
-        # 1..k の各iについて、最初のi文をコンテキストに、次の1文をターゲットに
+        k = min(max_context_sentences, max(1, n - 1))
+        # 1..k の各iについて、全ての開始位置 s を走査
+        # 文[ s : s+i ] をコンテキスト、文[ s+i ] をターゲットにする
         for i in range(1, k + 1):
-            context = "".join(sents[:i])
-            target = sents[i]
-            loss, ppl = compute_loss_and_ppl(tokenizer, model, context, target, device)
-            if not math.isnan(loss) and not math.isnan(ppl) and math.isfinite(loss) and math.isfinite(ppl):
-                ppl_buckets[i].append(ppl)
-                nent_buckets[i].append(loss / log_vocab)
+            max_start = (n - 1) - i  # s+i <= n-1 を満たす最大開始位置
+            if max_start < 0:
+                continue
+            for s in range(0, max_start + 1):
+                context = "".join(sents[s:s + i])
+                target = sents[s + i]
+                loss, ppl = compute_loss_and_ppl(tokenizer, model, context, target, device)
+                if not math.isnan(loss) and not math.isnan(ppl) and math.isfinite(loss) and math.isfinite(ppl):
+                    ppl_buckets[i].append(ppl)
+                    nent_buckets[i].append(loss / log_vocab)
 
     xs = []
     ppl_mean, ppl_std = [], []
@@ -157,6 +163,8 @@ def aggregate_over_articles(
 
 def main():
     import argparse
+    import os
+    os.makedirs("plots", exist_ok=True)
 
     parser = argparse.ArgumentParser(description="コンテキスト長を増やしたときのPPLと正規化エントロピー推移をプロット")
     parser.add_argument("--model", type=str, default="Qwen/Qwen2-0.5B", help="Hugging Face モデル名")
