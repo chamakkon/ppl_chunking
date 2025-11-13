@@ -173,8 +173,6 @@ def precompute_B_and_C(
         max_m = min(k_gram, i - 1)
         for m in range(1, max_m + 1):
             ctx_text = sep.join(sentences[i - m - 1:i - 1])
-            if ctx_text:
-                ctx_text = ctx_text + sep
             pairs.append((i, m))
             ctx_texts.append(ctx_text)
             tgt_texts.append(sentences[i - 1])
@@ -207,7 +205,7 @@ def dp_k_constrained_interval_segmentation(
     tokenizer=None,
     model=None,
     device: str = "cpu",
-    sep: str = " ",
+    sep: str = "",
 ) -> Tuple[List[Tuple[int, int]], float]:
     """
     目的関数は従来の coherence gain:
@@ -279,8 +277,6 @@ def dp_k_constrained_interval_segmentation(
                 else:
                     # 前チャンク: [ctx_s .. ctx_t] を包含するように、終端は +1 する
                     ctx_text = "" if ctx_s == 0 else sep.join(sentences[ctx_s - 1:ctx_t + 1])
-                    if ctx_text:
-                        ctx_text = ctx_text + sep
                     # ターゲット: [s .. j]（終端は既に排他的仕様で j を指定）
                     tgt_text = sep.join(sentences[s - 1:j])
                     sums, _ = compute_nll_sum_batch(tokenizer, model, [ctx_text], [tgt_text], device)
@@ -361,7 +357,8 @@ def main():
     outputs: List[str] = []
     for idx, sents in enumerate(articles, 1):
         print(f"[{idx}/{len(articles)}] 前計算中 ...")
-        sep = "" if args.dataset == "wikipedia_ja" else " "
+        # 制約なし実装に合わせる: どのデータセットでも文結合は空文字
+        sep = ""
         B, C, PB, PCk = precompute_B_and_C(sents, tokenizer, model, args.device, args.k_gram, args.batch_size, sep)
         print(f"[{idx}/{len(articles)}] DP最適化中 ...")
         chunks, score = dp_k_constrained_interval_segmentation(
