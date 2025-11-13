@@ -214,23 +214,50 @@ def dp_k_constrained_interval_segmentation(
     prev_idx = [-1] * (n + 1)
     DP[0] = 0.0
 
-    def nll_k(s: int, t: int) -> float:
-        # 先頭側（高々k項）
-        end_head = min(t, s + k_gram - 1)
+    def nll_k_with_prev_tail(s: int, t: int, L_prev: int) -> float:
+        """
+        k-sent制約に加え、前チャンク末尾の min(k, L_prev) 文も文脈として利用可能とする。
+        文 i の有効文脈 m(i) = min(k, L_prev + (i - s)), ただし m(i) <= i-1 を満たす。
+        これにより k が十分大きい場合、制約なし版の文脈（前チャンク全体 + 同一チャンク内）に近づく。
+        """
+        if s > t:
+            return 0.0
+        # しきい値 i >= s + max(0, k - L_prev) で m(i) は k に飽和
+        thresh = s + max(0, k_gram - L_prev)
+        head_end = min(t, thresh - 1)
         head = 0.0
-        for i in range(s, end_head + 1):
-            m = i - s  # 0..k-1
-            head += C[i][m]
+        # 頭側は高々 (k - L_prev) 項（L_prev>=kなら0項）
+        for i in range(s, head_end + 1):
+            d = i - s
+            m_eff = L_prev + d
+            # 安全側: m_eff は i-1 を超えない（理論上超えないが念のためmin）
+            if m_eff > i - 1:
+                m_eff = i - 1
+            if m_eff > k_gram:
+                m_eff = k_gram
+            head += C[i][m_eff]
         tail = 0.0
-        if s + k_gram <= t:
-            tail = PCk[t] - PCk[s + k_gram - 1]
+        # テールは m(i) = k 固定。i-1 >= k が保証される領域のみ。
+        if thresh <= t:
+            tail = PCk[t] - PCk[thresh - 1]
         return head + tail
 
     for j in range(1, n + 1):
         best = float("-inf")
         best_s = -1
         for s in range(1, j + 1):
-            gain = (PB[j] - PB[s - 1]) - nll_k(s, j)
+            # 前チャンク長 L_prev を最適prefix (s-1) の最後の区間から算出
+            if s == 1:
+                L_prev = 0
+            else:
+                last_start = prev_idx[s - 1]
+                # 万一未定義なら直前文のみを前チャンクとするフォールバック
+                if last_start == -1:
+                    last_start = s - 1
+                L_prev = (s - 1) - last_start + 1
+                if L_prev < 0:
+                    L_prev = 0
+            gain = (PB[j] - PB[s - 1]) - nll_k_with_prev_tail(s, j, L_prev)
             boundary_cost = 0.0 if s == 1 else alpha
             cand = DP[s - 1] + gain - boundary_cost
             if cand > best:
