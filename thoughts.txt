@@ -1,433 +1,250 @@
-いいテーマきた。
-じゃあ「**k-gram 文脈を使った効率的な coherence chunking**」の仕様書をちゃんと書こう。
+了解。以前の **coherence gain（チャンク全体を読んだときの尤度改善量）** を維持しつつ、**k-sent（直前 k 文までを文脈として許す）制約**を導入した DP アルゴリズムの仕様書をまとめます。
+ポイントは「目的関数はそのまま」「文脈は最大 k 文に切る」「前計算で O(kN)・DP 遷移 O(1)」。
 
 ---
 
 # 文チャンク分割アルゴリズム仕様書
 
-## （k-gram LM Coherence × Viterbi 型 DP）
-
----
+## （Coherence Gain 保持 × k-sent 制約 × 区間DP）
 
 ## 1. 目的
 
-文列 (S_1, \dots, S_N) を **チャンク**に分割する。
-各チャンクは、
-
-> 「そのチャンク内で、言語モデルにとって予測しやすい（coherent）」
-
-ようになっていて、かつ
-
-> 「チャンク間には、切るだけの理由（文脈の断絶）がある」
-
-ような分割を選びたい。
-
-ここでの特徴は：
-
-* **k-gram 文脈**
-  → 直前 1 文だけでなく、**直前 k 文まで**を文脈として NLL を評価する
-* **効率性**
-  → 文書長が大きくても、
-  計算量を **O(kN)** クラスに抑える
+文列 (S_1,\dots,S_N) をチャンク列 ({C_1,\dots,C_K}) に分割し、
+**チャンクとして読むことによる LM の負の対数尤度（NLL）の改善量（coherence gain）** の総和を最大化する。
+前計算で **各文に対する「直前 (m) 文文脈（(m\le k)）」の NLL** を用意し、**チャンク内 NLL を O(1)** で算出する。
 
 ---
 
-## 2. 設定と記法
+## 2. 前提・記法
 
-### 2.1 文列とチャンク
-
-* 入力テキストは文分割済みとする：
-
-[
-S_1, S_2, \dots, S_N
-]
-
-* チャンク (C) は連続区間：
-
-[
-C = S_{s..t} = {S_s, S_{s+1}, \dots, S_t}
-]
-
-* チャンク列：
-
-[
-\mathcal{C} = {C_1, C_2, \dots, C_K}, \quad C_0 = \text{BOS（仮想開始）}
-]
-
-### 2.2 使用するモデル
-
-* トークンレベルの log-likelihood（NLL）が取れる言語モデル（LM）
-* 文レベルの NLL を以下のように定義：
-
-[
-\text{NLL}(S \mid \text{context})
-= - \sum_{w \in S} \log P(w \mid \text{context と S 内 preceding tokens})
-]
+* 文列：(S_1,\dots,S_N)、各文のトークン列長は可変。
+* k-sent 制約：チャンク内で文 (S_i) を評価する際に使える文脈は **チャンク先頭からの距離**に応じて **最大 (k) 文**まで。
+* LM は token-level の logprob を返せる（温度0/greedy、同一トークナイザ）。
+* NLL 定義：(\mathrm{NLL}(S \mid \text{ctx})= -\sum_{w\in S}\log P(w\mid \text{ctx}+ \text{prefix}(S)))。
 
 ---
 
-## 3. k-gram 文脈と局所 gain の定義
+## 3. スコア定義（coherence gain を維持）
 
-### 3.1 文単体 NLL（ベースライン）
-
-各文 (S_i) を「文脈なし」で読んだ NLL：
+### 3.1 文単体 NLL（文脈なし）
 
 [
-B_i = \text{NLL}(S_i \mid \text{none})
+B_i = \mathrm{NLL}(S_i \mid \text{none})
 ]
 
-→ これは後で「文脈あり NLL」との差分を取るための基準。
-
-### 3.2 k-gram 文脈付き NLL
-
-最大文脈長 (K)（k-gram の k）を固定する。
-
-文 (S_i) に対して、
-ひとつ前〜最大 K 文までの文脈で NLL を計算：
+### 3.2 k-sent 条件付き NLL テンソル
 
 [
-C_i^{(m)} =
-\text{NLL}(S_i \mid S_{i-m}, S_{i-m+1}, \dots, S_{i-1})
+C_i^{(m)} = \mathrm{NLL}\big(S_i \mid S_{i-m},\dots,S_{i-1}\big),
+\quad m=0,\dots,\min(k,,i-1)
+]
+（(m=0) のとき (C_i^{(0)}=B_i)）
+
+### 3.3 チャンクの k-sent NLL
+
+チャンク (C=S_{s..t}) を **先頭からの距離 (d=i-s)** で分け、距離 (d<k) はちょうど (m=d)、距離 (d\ge k) は (m=k) を用いる：
+[
+\mathrm{NLL}*k(s..t) ;=;
+\sum*{i=s}^{\min(t,,s+k-1)} C_i^{(i-s)}
+;;+;;
+\sum_{i=s+k}^{t} C_i^{(k)}
 ]
 
-* (m = 1, \dots, \min(K, i-1))
-* (m = 0) のときは「文脈なし」とし、
-  (C_i^{(0)} = B_i) とみなす
-
-### 3.3 局所 coherence gain（文 i の文脈 m による改善量）
+### 3.4 チャンクの coherence gain（以前の目的関数のまま）
 
 [
-g_i^{(m)} = B_i - C_i^{(m)}
+G_k(s..t) ;=; \sum_{i=s}^{t} B_i ;-; \mathrm{NLL}_k(s..t)
 ]
-
-* (g_i^{(m)} > 0)：
-  文脈（直前 m 文）のおかげで NLL が下がった →
-  「その文脈のもとで文 i を同じチャンクに入れると得」
-* (g_i^{(m)} < 0)：
-  その文脈はむしろ邪魔 → 同じチャンクにすると損
+（※必要に応じて境界コスト (\alpha) を総和に (-\alpha\cdot #\text{boundaries}) として加算）
 
 ---
 
-## 4. 目的関数（スコア）の考え方
+## 4. 前計算（効率化の肝）
 
-### 4.1 直感的なゴール
+### 4.1 (B_i) と (C_i^{(m)}) の前計算
 
-* チャンク内では「適切な過去 m 文」を文脈として使うことで、
-  **文単体より予測しやすくなる**（gain が出る）
-* チャンク間の境界を増やすことには「コスト」を課す（切りすぎ防止）
+* 各文単体：(B_i=C_i^{(0)})（N 回）
+* 各文に対して (m=1..\min(k,i-1))：
+  コンテキスト ((S_{i-m},\dots,S_{i-1})) を結合して (C_i^{(m)}) を取得
+* 総 LM 呼び出し回数 ≈ **(O(kN))**
 
-### 4.2 グローバル目的
+### 4.2 prefix 和で O(1) 区間評価
 
-元々の“完全版”は
+* (B) の prefix：(PB[j]=\sum_{i=1}^j B_i)
+* (C^{(k)}) の prefix：(PC^{(k)}[j]=\sum_{i=1}^j C_i^{(k)})
 
+すると
 [
-\text{TotalScore} =
-\underbrace{\sum_{i=1}^N B_i}*{\text{文単体の NLL（固定）}}
-+
-\underbrace{\sum*{i=1}^N \text{文脈による改善量}}_{\text{区切りで変わる}}
-----------------------------------------------------------
-
-\underbrace{\alpha \cdot (\text{境界の数})}_{\text{境界コスト}}
+\sum_{i=s}^{t} B_i = PB[t]-PB[s-1]
 ]
-
-ここで (\sum B_i) は segmentation に関係なく一定値なので、
-最適化の対象は
-
 [
-\text{Score} =
-\sum_{i=1}^N \text{gain}_i
-
-* \alpha \cdot \text{#boundaries}
-  ]
-
-だけでよい。
-
-### 4.3 文 i の gain の選び方
-
-文 i を**どれくらい前までを同じチャンクとみなすか**で、使う (m) が変わり、
-gain が (g_i^{(m)}) に決まる：
-
-* 文 i がチャンクの先頭なら
-  → 「過去文が同じチャンクに存在しない」ので (m = 0)、gain = 0
-* 文 i がチャンク内の 2 個目なら
-  → 最大 (m=1)（直前1文）まで
-* 文 i がチャンク内の 3 個目なら
-  → 最大 (m=2)（直前2文）まで
-* …
-* 文 i がチャンク内の r 個目なら
-  → (m \le \min(K, r-1))
-
-DP では、
-「いまの文 i について、**同じチャンクの中で過去何文ぶんの文脈を使うか**」
-を状態として持つ。
+\sum_{i=s+k}^{t} C_i^{(k)} = PC^{(k)}[t] - PC^{(k)}[s+k-1]
+]
+先頭から (k) 文以内の部分（高々 (k) 項）は配列参照で逐次足す（定数時間扱い）。
 
 ---
 
-## 5. DP（Viterbi）設計
+## 5. 区間DP（Viterbi 型）
 
-### 5.1 状態定義
+### 5.1 状態
 
-最大文脈長を (K) とする。
-
-* i: いま注目している文インデックス（1..N）
-* m:
-
-  * 「**現在のチャンク内で、i の直前までに存在する文数**」
-  * かつ「文脈に使える最大文数」
-  * (m \in {0, 1, 2, \dots, K})
-
-つまり状態 ((i, m)) の意味：
-
-> 文1..i まで見終わった時点で、
-> 文 i は現在のチャンクの最後の文であり、
-> そのチャンク内には直前に m 文が連なっている（＝チャンク長は m+1 以上）状態
-
-これに対する DP テーブル：
-
-* `DP[i][m]` :
-  文1..iまでを処理し、
-  状態 m（上記）で終わるときの **Score の最大値**
-
-別途、復元用に
-
-* `prev_i[i][m]` : 直前の i-1 の m’
-* `prev_m[i][m]` : どの m’ から来たか
-* `boundary[i][m]` : ここで境界を置いたかどうか
-
-などを保持。
-
----
+* (DP[j])：文 (1..j) を最適に分割したときの **coherence gain 総和（境界コスト込み）** の最大値
+* (prev[j])：その最適解で最後のチャンクの開始位置 (s)
 
 ### 5.2 初期化
 
-文1はチャンク先頭から始めるので、
-**gain = 0**、文脈なし m=0 でよい：
-
-```python
-for m in 0..K:
-    DP[0][m] = -inf  # 0文目のダミー
-DP[0][0] = 0.0
-
-# 文1を処理
-i = 1
-# 文1は必ず新チャンク開始とみなす（境界コストは払わない or α/2 にしてもいいがここでは0扱い）
-DP[1][0] = 0.0  # gainも0
-```
-
----
+* (DP[0]=0)、(prev[0]=-1)
 
 ### 5.3 遷移
 
-文 i (2 ≤ i ≤ N) について、
-次の2つの遷移を考える：
-
-1. **チャンクをここで切って文 i を新チャンク先頭にする**
-2. **チャンクを継続して文 i を既存チャンクに繋げる**
-
-#### 5.3.1 ケース1：境界を置いて新チャンク開始
-
-* 文 i はチャンク先頭 ⇒ 文脈 m=0 ⇒ gain = 0
-* 直前 i-1 の状態は m’ が何でもよいが、境界コスト −α を払う
-
+各 (j=1..N) に対して、すべての開始 (s\in[1..j]) を試す。
+チャンク (S_{s..j}) のスコアは
 [
-DP[i][0] = \max_{m' \in 0..K} \big( DP[i-1][m'] - \alpha \big)
+\text{score}(s,j) ;=; DP[s-1] ;+; G_k(s..j) ;-; \alpha
 ]
+（ただし (s=1) の先頭チャンクには境界コストを引かない設計でもよい。実装で統一）
 
-実装上は、`best_prev = max_m' DP[i-1][m']` を毎 i で一回計算してから
+**評価の内訳（すべて O(1)）**
 
-```python
-DP[i][0] = best_prev - alpha
-boundary[i][0] = True
-```
+* (\sum_{i=s}^j B_i = PB[j]-PB[s-1])
+* (\mathrm{NLL}*k(s..j) = \underbrace{\sum*{i=s}^{\min(j,,s+k-1)} C_i^{(i-s)}}_{\text{高々 }k\text{ 項}}
+  ;+; \big( PC^{(k)}[j]-PC^{(k)}[s+k-1] \big))（(s+k\le j) のとき）
 
-とすればよい。
-
-#### 5.3.2 ケース2：チャンクを継続（同じチャンクに文 i を追加）
-
-ここが k-gram の肝。
-
-直前 i-1 の状態 m’ から文 i を追加したとき、
-新しい「チャンク内の過去文数」m は
-
+最大の (\text{score}(s,j)) をとる (s) を選び、
 [
-m = \min(K, m' + 1)
+DP[j]=\max_{s\le j}\text{score}(s,j),\quad prev[j]=\arg\max_s
 ]
-
-このとき文 i の gain として使うのは
-
-[
-g_i^{(m)} = B_i - C_i^{(m)}
-]
-
-なので、遷移は
-
-[
-DP[i][m] = \max_{m' \in 0..K ;:; \min(K, m' + 1) = m}
-\big( DP[i-1][m'] + g_i^{(m)} \big)
-]
-
-ここで (\min(K, m'+1) = m) を満たす m’ は実質 1通りか2通り：
-
-* (m < K) のとき：
-  (m = m'+1) ⇒ (m' = m-1)
-* (m = K) のとき：
-  (m' \in {K-1, K})（K-1以上は全部 K に潰れる）
-
-なので実装はかなり簡単になる。
-
-擬似コード：
-
-```python
-for i in range(2, N+1):
-    # まず境界を置くケース（m=0）
-    best_prev = max(DP[i-1][m] for m in 0..K)
-    DP[i][0] = best_prev - alpha
-    boundary[i][0] = True
-    prev_m[i][0] = argmax_m DP[i-1][m]
-
-    # 次にチャンク継続
-    # m = 1..K-1
-    for m in range(1, K):
-        prev_state = m - 1
-        gain = g[i][m]    # 事前計算済みの g_i^{(m)}
-        DP[i][m] = DP[i-1][prev_state] + gain
-        boundary[i][m] = False
-        prev_m[i][m] = prev_state
-
-    # m = K
-    # prev_state could be K-1 or K
-    gain = g[i][K]
-    cand1 = DP[i-1][K-1] + gain
-    cand2 = DP[i-1][K] + gain
-    if cand1 >= cand2:
-        DP[i][K] = cand1
-        prev_m[i][K] = K-1
-    else:
-        DP[i][K] = cand2
-        prev_m[i][K] = K
-    boundary[i][K] = False
-```
-
----
 
 ### 5.4 復元
 
-最後に、文 N で最大スコアを持つ m* を選ぶ：
+(j=N) から (s=prev[j]) をたどって区間を逆順に復元、最後に反転。
 
-```python
-m_star = argmax_m DP[N][m]
-i = N
-chunks = []
-current_end = N
-current_start = None
-```
+### 5.5 計算量
 
-後ろ向きに辿る：
-
-```python
-while i > 0:
-    m = m_star
-    if boundary[i][m]:
-        # i がチャンク先頭
-        current_start = i
-        chunks.append((current_start, current_end))
-        current_end = i - 1
-
-    # 1つ前へ
-    prev_m_state = prev_m[i][m]
-    i -= 1
-    m_star = prev_m_state
-
-# 逆順に直す
-chunks.reverse()
-```
-
-境界の扱いをもう少し丁寧にすると、
-
-* boundary==True なら「ここから新チャンク」
-* boundary==False なら前と同じチャンク
-
-としてチャンクの始端・終端を記録すればOK。
+* 遷移評価：各 ((s,j)) が **O(1)** → DP 全体 **O(N²)**
+* 前計算：LM 呼び出し **O(kN)**、prefix 構築 **O(N)**
+* メモリ：(B_i)、(C_i^{(m)})（先頭側 (m<k) 用）、(PC^{(k)})、(PB)、(DP)、(prev)
 
 ---
 
-## 6. 前処理：NLL と g_i^{(m)} の効率的な計算
+## 6. 実装詳細・規約
 
-### 6.1 文単体 NLL (B_i)
+### 6.1 プロンプト整形の固定
 
-全文について：
+* 文脈結合：`S_{i-m} \n\n ... \n\n S_{i-1} <SEP> S_i` 等を**仕様で固定**
+* BOS/EOS、改行、全角/半角、空白の扱いを固定（NLL が揺れるのを防止）
+* **温度0 / greedy / 同一トークナイザ** を厳守
+
+### 6.2 数値安定・スケーリング
+
+* NLL はトークン長に比例→文長正規化（per-token NLL）を推奨
+
+  * ( \hat{B}_i = B_i/\text{len}(S_i)), ( \hat{C}_i^{(m)} = C_i^{(m)}/\text{len}(S_i))
+  * 同様に (PC^{(k)}), (PB) は正規化版で構築
+* 境界コスト (\alpha) は **開発セットで P90〜P95 の (G_k(s..t)) スケール**に合わせてチューニング
+* 必要なら温度パラメータ (\tau) により (G_k) を (G_k/\tau) でシャープ化
+
+### 6.3 制約（任意）
+
+* 最小/最大チャンク長（文/トークン）：
+  遷移時に不適合区間をスキップ
+* k の選定：2–3 が実用中庸、5 以上は LM 呼び出し増加と文脈過学習に注意
+
+---
+
+## 7. 疑似コード
 
 ```python
-for i in 1..N:
-    B[i] = NLL(S_i | none)
+# 前計算
+B = [0]*(N+1)                  # 1-indexed
+C = [[None]*(k+1) for _ in range(N+1)]
+for i in range(1, N+1):
+    B[i] = NLL(S[i], ctx=None)            # per-tokenで正規化推奨
+    C[i][0] = B[i]
+    max_m = min(k, i-1)
+    for m in range(1, max_m+1):
+        ctx = concat(S[i-m:i])            # 固定整形
+        C[i][m] = NLL(S[i], ctx=ctx)      # per-token
+
+# prefix
+PB = [0]*(N+1)
+PCk = [0]*(N+1)
+for i in range(1, N+1):
+    PB[i] = PB[i-1] + B[i]
+    # k-文脈が定義できる場合のみ
+    if i >= 2:
+        PCk[i] = PCk[i-1] + (C[i][min(k, i-1)] if (i-1) >= 1 else C[i][0])
+    else:
+        PCk[i] = 0
+
+def NLL_k(s, t):
+    # 先頭側（高々k項）
+    end_head = min(t, s + k - 1)
+    head = 0.0
+    for i in range(s, end_head + 1):
+        m = i - s
+        head += C[i][m]
+    # テール側（prefix差）
+    tail = 0.0
+    if s + k <= t:
+        tail = PCk[t] - PCk[s + k - 1]
+    return head + tail
+
+def Gk(s, t):
+    return (PB[t] - PB[s-1]) - NLL_k(s, t)
+
+# DP
+DP = [-1e30]*(N+1)
+prev_idx = [-1]*(N+1)
+DP[0] = 0.0
+for j in range(1, N+1):
+    best = -1e30
+    best_s = -1
+    for s in range(1, j+1):
+        score = DP[s-1] + Gk(s, j) - (0.0 if s==1 else alpha)
+        if score > best:
+            best = score
+            best_s = s
+    DP[j] = best
+    prev_idx[j] = best_s
+
+# 復元
+segments = []
+j = N
+while j > 0:
+    s = prev_idx[j]
+    segments.append((s, j))
+    j = s - 1
+segments.reverse()
 ```
 
-* 1文ずつ LM に投げるだけなので O(N) 回
-* コンテキスト長制約にも引っかからない
+---
 
-### 6.2 k-gram 文脈付き NLL (C_i^{(m)})
+## 8. 検証・チューニング手順
 
-最大 K に対して：
-
-```python
-for i in 1..N:
-    for m in 1..min(K, i-1):
-        context = concat(S_{i-m}, ..., S_{i-1})
-        C[i][m] = NLL(S_i | context)
-        g[i][m] = B[i] - C[i][m]
-    g[i][0] = 0.0   # 文頭扱い
-```
-
-* LM 呼び出し回数は
-  (\sum_{i=1}^N \min(K, i-1) \approx O(KN))
-* K は小さい（2〜3）想定なので、**全体 O(N)** に近い
-
-これで DP 内ではすべて O(1) で参照可能。
+1. **再現性チェック**：固定乱数・同一整形で (B_i, C_i^{(m)}) の分布を保存
+2. **α スイープ**：開発セットで分割数、平均長、目的タスク（RAG 検索 nDCG/QA EM/F1）を最適化
+3. **k スイープ**：(k \in {1,2,3,5}) で品質/コストトレードオフを確認
+4. **正規化の有無**：per-token 正規化・文長補正（z-score/robust）を比較
+5. **アブレーション**：先頭側 (k) 項の寄与、(C^{(k)}) のみ使用の近似との性能差
 
 ---
 
-## 7. 計算量とメモリ
+## 9. 計算量まとめ
 
-* 前処理（NLL 計算）：
-
-  * 文単体：N 回
-  * 文脈付き：最大 K 文脈 × N → **O(KN)** LM 呼び出し
-* DP：
-
-  * i=1..N, m=0..K のループ → **O(KN)**
-
-最大文脈長 K を定数（例えば 2 or 3）に固定すれば、
-
-> **時間計算量：O(N)**（定数 K を無視したオーダー）
-> メモリ：O(KN)
-
-となる。
+* 前計算（LM 呼び出し）：**(O(kN))**
+* DP：**(O(N^2))**（各区間評価 O(1)）
+* 全体：実運用では (N \lesssim 400) 程度なら余裕。長文多量なら二段階化（候補境界を一次元DPで絞り→再採点）も可。
 
 ---
 
-## 8. あなたの問題意識との対応関係
+## 10. 注記（よくハマる点）
 
-* A→B はあまり gain がない（g_B^{(1)} 小さい）
-* でも B→C, A,B→C の文脈では NLL が大きく改善する場合、
-
-  * C に対して (g_C^{(2)}) が高くなる
-  * 「同じチャンク内で直前2文を文脈に使う」状態 (m=2) が有利になる
-* DP は
-
-  * B を A と切るべきか
-  * B,C を一緒のチャンクにするべきか
-    を **g_B^{(1)}, g_C^{(2)}, 境界コスト α のトレードオフ**でグローバルに決める
-
-つまり、
-
-> 「直前文だけではなく、直前 2〜3 文までの影響を入れた上で
-> どこで切るかを DP で決める」
-
-という形で、
-**あなたの “A→B は変でも AB→C で一貫する” 問題意識を
-k-gram の範囲でちゃんと反映できる**仕様になっている。
+* 改行や区切りトークン差で NLL が大きく揺れる → **整形を仕様で固定**
+* モデル切替でスケールが変わる → **(\alpha) 再学習必須**
+* 文分割差 → **同一ルールで凍結**
+* 極端に短い/長い文 → **長さ正規化**で安定
 
 ---
 
-これをそのまま設計書として使って、
-あとは「どの LM を使うか（軽量モデルか、本番モデルか）」「K=2 or 3」「α の選び方」を実験で詰めれば、そのまま RAG 用の chunker として実装に落とせるはず。
+この設計で「以前の coherence gain 目的」を保持しながら、「文脈は最大 k 文まで」に制約して **O(kN) 前計算 + O(N²) DP** を実現できます。品質優先ならこの版、速度優先なら先に一次元の近似で候補境界を抽出してから本 DP で確定、という二段階運用が扱いやすいです。

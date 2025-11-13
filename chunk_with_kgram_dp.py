@@ -135,24 +135,24 @@ def compute_nll_sum_batch(
     return sum_nll_per_sample.tolist(), num_tokens_per_sample.tolist()
 
 
-def precompute_base_and_gains(
+def precompute_B_and_C(
     sentences: List[str],
     tokenizer,
     model,
     device: str,
     k_gram: int,
     batch_size: int,
-) -> Tuple[List[float], List[List[float]]]:
+) -> Tuple[List[float], List[List[float]], List[float], List[float]]:
     """
-    前処理で
+    前処理で以下を返す（1-based配列、先頭にダミー）:
       - B[i]: 文iのbase NLL（BOS文脈）合計
-      - g[i][m]: 文iの局所coherence gain（直前m文文脈, 0..K）を前計算
-    を返す。1-basedインデックスで返却（先頭にダミーを持つ）。
+      - C[i][m]: 文iの文脈m(0..K, ただしm<=i-1)でのNLL合計（C[i][0] = B[i]）
+      - PB[j]: Bのprefix和
+      - PCk[j]: C[i][min(K, i-1)] のprefix和
     """
     n = len(sentences)
-    # 1) base NLL（B_i）
-    B = [0.0] * (n + 1)
-    # バッチで計算
+    # 1) B_i をバッチで計算
+    B: List[float] = [0.0] * (n + 1)
     for start in range(1, n + 1, batch_size):
         end = min(n, start + batch_size - 1)
         ctxs = [""] * (end - start + 1)
@@ -161,10 +161,10 @@ def precompute_base_and_gains(
         for offset, i in enumerate(range(start, end + 1)):
             B[i] = sums[offset]
 
-    # 2) g_i^{(m)} の前計算（m=0..K）
-    g: List[List[float]] = [[0.0] * (k_gram + 1) for _ in range(n + 1)]
-    # m=0 は常に 0（チャンク先頭）
-    # m>=1 は O(KN) 件をバッチにまとめて計算
+    # 2) C_i^{(m)} を前計算（m=0..K, m<=i-1）
+    C: List[List[float]] = [[0.0] * (k_gram + 1) for _ in range(n + 1)]
+    for i in range(1, n + 1):
+        C[i][0] = B[i]
     pairs: List[Tuple[int, int]] = []  # (i, m)
     ctx_texts: List[str] = []
     tgt_texts: List[str] = []
@@ -175,99 +175,79 @@ def precompute_base_and_gains(
             pairs.append((i, m))
             ctx_texts.append(ctx_text)
             tgt_texts.append(sentences[i - 1])
-    # バッチ評価
+    # バッチ評価して C を埋める
     for start in range(0, len(pairs), batch_size):
         end = min(len(pairs), start + batch_size)
         sums, _ = compute_nll_sum_batch(tokenizer, model, ctx_texts[start:end], tgt_texts[start:end], device)
         for offset, (i, m) in enumerate(pairs[start:end]):
-            g[i][m] = B[i] - sums[offset]
-    return B, g
+            C[i][m] = sums[offset]
+
+    # 3) prefix 和
+    PB: List[float] = [0.0] * (n + 1)
+    PCk: List[float] = [0.0] * (n + 1)
+    for i in range(1, n + 1):
+        PB[i] = PB[i - 1] + B[i]
+        m_eff = min(k_gram, i - 1) if i - 1 >= 0 else 0
+        PCk[i] = PCk[i - 1] + (C[i][m_eff] if m_eff >= 0 else 0.0)
+
+    return B, C, PB, PCk
 
 
-def dp_kgram_segmentation(
+def dp_k_constrained_interval_segmentation(
     sentences: List[str],
-    g: List[List[float]],
+    B: List[float],
+    C: List[List[float]],
+    PB: List[float],
+    PCk: List[float],
     k_gram: int,
     alpha: float,
 ) -> Tuple[List[Tuple[int, int]], float]:
     """
-    k-gram DP（Viterbi型）
-    DP[i][m]:
-      文1..iまで処理し、文iでチャンクを継続しており、そのチャンク内の過去文数がm（0..K）の最大スコア
-    遷移：
-      - 新チャンク開始: DP[i][0] = max_m DP[i-1][m] - alpha
-      - 継続: DP[i][m] = DP[i-1][m-1] + g[i][m]（m=1..K）ただし m=K のとき max(DP[i-1][K-1], DP[i-1][K]) + g[i][K]
-    復元は boundary 配列と prev_m で行う。
+    目的関数は従来の coherence gain:
+      G_k(s..t) = sum_{i=s}^t B_i - NLL_k(s..t)
+    遷移は区間DP:
+      DP[j] = max_s DP[s-1] + G_k(s..j) - (0 if s==1 else alpha)
     """
     n = len(sentences)
     # DPと復元用
-    DP = [[float("-inf")] * (k_gram + 1) for _ in range(n + 1)]
-    prev_m = [[-1] * (k_gram + 1) for _ in range(n + 1)]
-    boundary = [[False] * (k_gram + 1) for _ in range(n + 1)]
+    DP = [float("-inf")] * (n + 1)
+    prev_idx = [-1] * (n + 1)
+    DP[0] = 0.0
 
-    # 初期化（文1は新チャンク開始、gain=0）
-    DP[0][0] = 0.0
-    for m in range(1, k_gram + 1):
-        DP[0][m] = float("-inf")
-    DP[1][0] = 0.0
-    boundary[1][0] = True
-    prev_m[1][0] = 0
-    for m in range(1, k_gram + 1):
-        DP[1][m] = float("-inf")
+    def nll_k(s: int, t: int) -> float:
+        # 先頭側（高々k項）
+        end_head = min(t, s + k_gram - 1)
+        head = 0.0
+        for i in range(s, end_head + 1):
+            m = i - s  # 0..k-1
+            head += C[i][m]
+        tail = 0.0
+        if s + k_gram <= t:
+            tail = PCk[t] - PCk[s + k_gram - 1]
+        return head + tail
 
-    for i in range(2, n + 1):
-        # 新チャンク開始（m=0）
-        best_prev = float("-inf")
-        best_prev_m_state = 0
-        for m in range(0, k_gram + 1):
-            if DP[i - 1][m] > best_prev:
-                best_prev = DP[i - 1][m]
-                best_prev_m_state = m
-        DP[i][0] = best_prev - alpha
-        boundary[i][0] = True
-        prev_m[i][0] = best_prev_m_state
+    for j in range(1, n + 1):
+        best = float("-inf")
+        best_s = -1
+        for s in range(1, j + 1):
+            gain = (PB[j] - PB[s - 1]) - nll_k(s, j)
+            boundary_cost = 0.0 if s == 1 else alpha
+            cand = DP[s - 1] + gain - boundary_cost
+            if cand > best:
+                best = cand
+                best_s = s
+        DP[j] = best
+        prev_idx[j] = best_s
 
-        # 継続（m=1..K-1）
-        for m in range(1, k_gram):
-            if DP[i - 1][m - 1] != float("-inf"):
-                DP[i][m] = DP[i - 1][m - 1] + g[i][m]
-                prev_m[i][m] = m - 1
-                boundary[i][m] = False
-            else:
-                DP[i][m] = float("-inf")
-                prev_m[i][m] = -1
-                boundary[i][m] = False
+    total_score = DP[n]
 
-        # 継続（m=K）
-        cand1 = DP[i - 1][k_gram - 1] + g[i][k_gram] if DP[i - 1][k_gram - 1] != float("-inf") else float("-inf")
-        cand2 = DP[i - 1][k_gram] + g[i][k_gram] if DP[i - 1][k_gram] != float("-inf") else float("-inf")
-        if cand1 >= cand2:
-            DP[i][k_gram] = cand1
-            prev_m[i][k_gram] = k_gram - 1
-        else:
-            DP[i][k_gram] = cand2
-            prev_m[i][k_gram] = k_gram
-        boundary[i][k_gram] = False
-
-    # 終端選択
-    last_i = n
-    last_m = max(range(k_gram + 1), key=lambda m: DP[last_i][m])
-    total_score = DP[last_i][last_m]
-
-    # 復元
+    # 復元（区間）
     chunks: List[Tuple[int, int]] = []
-    current_end = n
-    i = n
-    m = last_m
-    while i > 0:
-        if boundary[i][m]:
-            # i がチャンク先頭
-            start = i
-            chunks.append((start, current_end))
-            current_end = i - 1
-        pm = prev_m[i][m]
-        i -= 1
-        m = pm if pm is not None else 0
+    j = n
+    while j > 0:
+        s = prev_idx[j]
+        chunks.append((s, j))
+        j = s - 1
     chunks.reverse()
     return chunks, total_score
 
@@ -293,15 +273,15 @@ def render_article_chunks(article_id: int, sentences: List[str], chunks: List[Tu
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="k-gram Coherence × Viterbi DP（高速版）")
+    parser = argparse.ArgumentParser(description="k-sent制約付き Coherence Gain × 区間DP（高速前計算）")
     parser.add_argument("--model", type=str, default="Qwen/Qwen2-0.5B")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--dataset", type=str, default="wikitext", choices=["wikitext", "wikipedia_ja"])
     parser.add_argument("--dataset_slice", type=str, default="train[:1%]", help="wikipedia_ja用のスライス")
     parser.add_argument("--max_articles", type=int, default=3)
     parser.add_argument("--min_sentences", type=int, default=6)
-    parser.add_argument("--k_gram", type=int, default=2, help="文脈の最大文数K")
-    parser.add_argument("--alpha", type=float, default=0.5, help="境界コスト")
+    parser.add_argument("--k_gram", type=int, default=2, help="文脈の最大文数k（遷移コストの制約）")
+    parser.add_argument("--alpha", type=float, default=0.5, help="境界コスト（先頭チャンクは未適用）")
     parser.add_argument("--batch_size", type=int, default=16, help="LM前計算のバッチサイズ")
     parser.add_argument("--output", type=str, default="outputs/kgram_dp_chunks.txt")
     args = parser.parse_args()
@@ -323,9 +303,9 @@ def main():
     outputs: List[str] = []
     for idx, sents in enumerate(articles, 1):
         print(f"[{idx}/{len(articles)}] 前計算中 ...")
-        _, g = precompute_base_and_gains(sents, tokenizer, model, args.device, args.k_gram, args.batch_size)
+        B, C, PB, PCk = precompute_B_and_C(sents, tokenizer, model, args.device, args.k_gram, args.batch_size)
         print(f"[{idx}/{len(articles)}] DP最適化中 ...")
-        chunks, score = dp_kgram_segmentation(sents, g, args.k_gram, args.alpha)
+        chunks, score = dp_k_constrained_interval_segmentation(sents, B, C, PB, PCk, args.k_gram, args.alpha)
         outputs.append(render_article_chunks(idx, sents, chunks, score))
 
     with open(args.output, "w", encoding="utf-8") as f:
