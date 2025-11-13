@@ -32,7 +32,8 @@ def load_wikipedia_ja_articles(
     Wikipedia（JA）から小規模サンプルを取得し、文分割して記事ごとの文列を返す。
     dataset_slice 例: 'train[:1%]', 'train[:2000]'
     """
-    ds = load_dataset("wikipedia", "20220301.ja", split=dataset_slice)
+    # 新方式のデータセット（旧 'wikipedia' スクリプトは非対応）
+    ds = load_dataset("wikimedia/wikipedia", "20231101.ja", split=dataset_slice)
     articles: List[List[str]] = []
     for rec in ds:
         text = rec.get("text") or ""
