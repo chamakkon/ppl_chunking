@@ -201,6 +201,9 @@ def dp_k_constrained_interval_segmentation(
     PCk: List[float],
     k_gram: int,
     alpha: float,
+    tokenizer=None,
+    model=None,
+    device: str = "cpu",
 ) -> Tuple[List[Tuple[int, int]], float]:
     """
     目的関数は従来の coherence gain:
@@ -213,6 +216,8 @@ def dp_k_constrained_interval_segmentation(
     DP = [float("-inf")] * (n + 1)
     prev_idx = [-1] * (n + 1)
     DP[0] = 0.0
+    # 直接チャンクNLLのキャッシュ（必要時のみ使用）
+    chunk_nll_cache: Dict[Tuple[int, int, int, int], float] = {}
 
     def nll_k_with_prev_tail(s: int, t: int, L_prev: int) -> float:
         """
@@ -257,7 +262,27 @@ def dp_k_constrained_interval_segmentation(
                 L_prev = (s - 1) - last_start + 1
                 if L_prev < 0:
                     L_prev = 0
-            gain = (PB[j] - PB[s - 1]) - nll_k_with_prev_tail(s, j, L_prev)
+            # k が十分大きい場合は、厳密に「前チャンク全文脈 + 現チャンク丸ごと」のNLLを直接計算して一致性を担保
+            use_direct = (k_gram >= (j - 1)) and (tokenizer is not None) and (model is not None)
+            if use_direct:
+                if s == 1:
+                    ctx_s, ctx_t = 0, 0
+                else:
+                    ctx_s, ctx_t = last_start, s - 1
+                key = (ctx_s, ctx_t, s, j)
+                if key in chunk_nll_cache:
+                    nll_val = chunk_nll_cache[key]
+                else:
+                    # 前チャンク: [ctx_s .. ctx_t] を包含するように、終端は +1 する
+                    ctx_text = "" if ctx_s == 0 else "".join(sentences[ctx_s - 1:ctx_t + 1])
+                    # ターゲット: [s .. j]（終端は既に排他的仕様で j を指定）
+                    tgt_text = "".join(sentences[s - 1:j])
+                    sums, _ = compute_nll_sum_batch(tokenizer, model, [ctx_text], [tgt_text], device)
+                    nll_val = sums[0]
+                    chunk_nll_cache[key] = nll_val
+            else:
+                nll_val = nll_k_with_prev_tail(s, j, L_prev)
+            gain = (PB[j] - PB[s - 1]) - nll_val
             boundary_cost = 0.0 if s == 1 else alpha
             cand = DP[s - 1] + gain - boundary_cost
             if cand > best:
@@ -332,7 +357,9 @@ def main():
         print(f"[{idx}/{len(articles)}] 前計算中 ...")
         B, C, PB, PCk = precompute_B_and_C(sents, tokenizer, model, args.device, args.k_gram, args.batch_size)
         print(f"[{idx}/{len(articles)}] DP最適化中 ...")
-        chunks, score = dp_k_constrained_interval_segmentation(sents, B, C, PB, PCk, args.k_gram, args.alpha)
+        chunks, score = dp_k_constrained_interval_segmentation(
+            sents, B, C, PB, PCk, args.k_gram, args.alpha, tokenizer=tokenizer, model=model, device=args.device
+        )
         outputs.append(render_article_chunks(idx, sents, chunks, score))
 
     with open(args.output, "w", encoding="utf-8") as f:
