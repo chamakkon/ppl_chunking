@@ -19,3 +19,4 @@ urllib3==2.5.0
 torch
 datasets
 matplotlib
+mwparserfromhell
