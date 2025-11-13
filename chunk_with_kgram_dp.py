@@ -142,6 +142,7 @@ def precompute_B_and_C(
     device: str,
     k_gram: int,
     batch_size: int,
+    sep: str,
 ) -> Tuple[List[float], List[List[float]], List[float], List[float]]:
     """
     前処理で以下を返す（1-based配列、先頭にダミー）:
@@ -171,7 +172,7 @@ def precompute_B_and_C(
     for i in range(1, n + 1):
         max_m = min(k_gram, i - 1)
         for m in range(1, max_m + 1):
-            ctx_text = "".join(sentences[i - m - 1:i - 1])
+            ctx_text = sep.join(sentences[i - m - 1:i - 1])
             pairs.append((i, m))
             ctx_texts.append(ctx_text)
             tgt_texts.append(sentences[i - 1])
@@ -204,6 +205,7 @@ def dp_k_constrained_interval_segmentation(
     tokenizer=None,
     model=None,
     device: str = "cpu",
+    sep: str = " ",
 ) -> Tuple[List[Tuple[int, int]], float]:
     """
     目的関数は従来の coherence gain:
@@ -274,9 +276,9 @@ def dp_k_constrained_interval_segmentation(
                     nll_val = chunk_nll_cache[key]
                 else:
                     # 前チャンク: [ctx_s .. ctx_t] を包含するように、終端は +1 する
-                    ctx_text = "" if ctx_s == 0 else "".join(sentences[ctx_s - 1:ctx_t + 1])
+                    ctx_text = "" if ctx_s == 0 else sep.join(sentences[ctx_s - 1:ctx_t + 1])
                     # ターゲット: [s .. j]（終端は既に排他的仕様で j を指定）
-                    tgt_text = "".join(sentences[s - 1:j])
+                    tgt_text = sep.join(sentences[s - 1:j])
                     sums, _ = compute_nll_sum_batch(tokenizer, model, [ctx_text], [tgt_text], device)
                     nll_val = sums[0]
                     chunk_nll_cache[key] = nll_val
@@ -355,10 +357,12 @@ def main():
     outputs: List[str] = []
     for idx, sents in enumerate(articles, 1):
         print(f"[{idx}/{len(articles)}] 前計算中 ...")
-        B, C, PB, PCk = precompute_B_and_C(sents, tokenizer, model, args.device, args.k_gram, args.batch_size)
+        sep = "" if args.dataset == "wikipedia_ja" else " "
+        B, C, PB, PCk = precompute_B_and_C(sents, tokenizer, model, args.device, args.k_gram, args.batch_size, sep)
         print(f"[{idx}/{len(articles)}] DP最適化中 ...")
         chunks, score = dp_k_constrained_interval_segmentation(
-            sents, B, C, PB, PCk, args.k_gram, args.alpha, tokenizer=tokenizer, model=model, device=args.device
+            sents, B, C, PB, PCk, args.k_gram, args.alpha,
+            tokenizer=tokenizer, model=model, device=args.device, sep=sep
         )
         outputs.append(render_article_chunks(idx, sents, chunks, score))
 
