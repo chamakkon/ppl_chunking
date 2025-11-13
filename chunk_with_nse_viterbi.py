@@ -115,15 +115,32 @@ def viterbi_chunk(
 
     vocab_size = len(tokenizer)
 
+    # 退化回避のための調整項
+    # - chunk_bias: チャンク1つごとに与える正のボーナス（分割を促す）
+    # - len_penalty_per_token: チャンクのトークン長に比例した負のペナルティ（長大チャンクを抑制）
+    chunk_bias = 0.05
+    len_penalty_per_token = 0.001
+
     # メモ化（再計算コスト削減）
     # φ(C) 用: 文区間テキスト -> log NSE
     node_log_cache: Dict[Tuple[int, int], float] = {}
     # ψ(C | C_prev) 用: (prev_s, prev_t, s, t) -> log NSE
     trans_log_cache: Dict[Tuple[int, int, int, int], float] = {}
+    # チャンクのトークン長キャッシュ
+    chunk_toklen_cache: Dict[Tuple[int, int], int] = {}
 
     def chunk_text(si: int, tj: int) -> str:
         # 1-based inclusive indices
         return "".join(sentences[si - 1:tj])
+
+    def chunk_toklen(si: int, tj: int) -> int:
+        key = (si, tj)
+        if key in chunk_toklen_cache:
+            return chunk_toklen_cache[key]
+        text = chunk_text(si, tj)
+        toklen = len(tokenizer.encode(text, add_special_tokens=False))
+        chunk_toklen_cache[key] = toklen
+        return toklen
 
     def phi(si: int, tj: int) -> float:
         key = (si, tj)
@@ -131,7 +148,12 @@ def viterbi_chunk(
             return node_log_cache[key]
         ce = compute_ce(tokenizer, model, context="", target=chunk_text(si, tj), device=device)
         nse = nse_from_ce(ce, vocab_size)
+        # log(NSE) に調整項を加える
         val = math.log(nse)
+        # チャンク数ボーナス（分割を促進）
+        val += chunk_bias
+        # 長さペナルティ（長大チャンク抑制）
+        val -= len_penalty_per_token * float(chunk_toklen(si, tj))
         node_log_cache[key] = val
         return val
 
